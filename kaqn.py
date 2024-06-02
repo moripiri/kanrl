@@ -1,34 +1,34 @@
 import os
 import time
-import random
 
 import gymnasium as gym
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from hydra.core.hydra_config import HydraConfig
 from kan import KAN
 from torch.utils.tensorboard import SummaryWriter
-import numpy as np
 
 from buffer import ReplayBuffer
 import hydra
 from omegaconf import DictConfig
 from tqdm import tqdm
 
+from common import set_all_seeds
 
 def kan_train(
-    net,
-    target,
-    data,
-    optimizer,
-    gamma=0.99,
-    lamb=0.0,
-    lamb_l1=1.0,
-    lamb_entropy=2.0,
-    lamb_coef=0.0,
-    lamb_coefdiff=0.0,
-    small_mag_threshold=1e-16,
-    small_reg_factor=1.0,
+        net,
+        target,
+        data,
+        optimizer,
+        gamma=0.99,
+        lamb=0.0,
+        lamb_l1=1.0,
+        lamb_entropy=2.0,
+        lamb_coef=0.0,
+        lamb_coefdiff=0.0,
+        small_mag_threshold=1e-16,
+        small_reg_factor=1.0,
 ):
     def reg(acts_scale):
         def nonlinear(x, th=small_mag_threshold, factor=small_reg_factor):
@@ -63,11 +63,11 @@ def kan_train(
         next_q_values_target = target(next_observations)
         target_max = next_q_values_target[range(len(next_q_values)), next_actions]
         td_target = rewards.flatten() + gamma * target_max * (
-            1 - terminations.flatten()
+                1 - terminations.flatten()
         )
 
     old_val = net(observations).gather(1, actions).squeeze()
-    loss = nn.functional.mse_loss(td_target, old_val)
+    loss = F.mse_loss(old_val, td_target)
     reg_ = reg(net.acts_scale)
     loss = loss + lamb * reg_
     optimizer.zero_grad()
@@ -77,11 +77,11 @@ def kan_train(
 
 
 def mlp_train(
-    net,
-    target,
-    data,
-    optimizer,
-    gamma=0.99,
+        net,
+        target,
+        data,
+        optimizer,
+        gamma=0.99,
 ):
     observations, actions, next_observations, rewards, terminations = data
 
@@ -91,7 +91,7 @@ def mlp_train(
         next_q_values_target = target(next_observations)
         target_max = next_q_values_target[range(len(next_q_values)), next_actions]
         td_target = rewards.flatten() + gamma * target_max * (
-            1 - terminations.flatten()
+                1 - terminations.flatten()
         )
 
     old_val = net(observations).gather(1, actions).squeeze()
@@ -102,19 +102,14 @@ def mlp_train(
     return loss.item()
 
 
-def set_all_seeds(seed):
-    random.seed(seed)
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.use_deterministic_algorithms(True)
-
-
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(config: DictConfig):
     set_all_seeds(config.seed)
     env = gym.make(config.env_id)
+
+    #assert gymnasium env space types
+    assert isinstance(env.observation_space, gym.spaces.Box) and isinstance(env.action_space, gym.spaces.Discrete)
+
     if config.method == "KAN":
         q_network = KAN(
             width=[env.observation_space.shape[0], config.width, env.action_space.n],
@@ -133,24 +128,34 @@ def main(config: DictConfig):
             sb_trainable=False,
         )
         train = kan_train
+
     elif config.method == "MLP":
+        # fixed it to 2-hidden layer mlp
         q_network = nn.Sequential(
             nn.Linear(env.observation_space.shape[0], config.width),
             nn.ReLU(),
+            # nn.Linear(config.width, config.width),
+            # nn.ReLU(),
             nn.Linear(config.width, env.action_space.n),
         )
         target_network = nn.Sequential(
             nn.Linear(env.observation_space.shape[0], config.width),
             nn.ReLU(),
+            # nn.Linear(config.width, config.width),
+            # nn.ReLU(),
             nn.Linear(config.width, env.action_space.n),
         )
         train = mlp_train
+
     else:
         raise Exception(
             f"Method {config.method} don't exist, choose between MLP and KAN."
         )
 
     target_network.load_state_dict(q_network.state_dict())
+
+    optimizer = torch.optim.Adam(q_network.parameters(), config.learning_rate)
+    buffer = ReplayBuffer(config.replay_buffer_capacity, env.observation_space.shape[0], 1)
 
     run_name = f"{config.method}_{config.env_id}_{config.seed}_{int(time.time())}"
 
@@ -159,9 +164,6 @@ def main(config: DictConfig):
     os.makedirs("results", exist_ok=True)
     with open(f"results/{run_name}.csv", "w") as f:
         f.write("episode,length\n")
-
-    optimizer = torch.optim.Adam(q_network.parameters(), config.learning_rate)
-    buffer = ReplayBuffer(config.replay_buffer_capacity, env.observation_space.shape[0])
 
     writer.add_text(
         "hyperparameters",
@@ -179,6 +181,7 @@ def main(config: DictConfig):
         while not finished:
             if episode < config.warm_up_episodes:
                 action = env.action_space.sample()
+
             else:
                 action = (
                     q_network(observation.unsqueeze(0).double())
@@ -196,8 +199,10 @@ def main(config: DictConfig):
             observation = next_observation
             finished = terminated or truncated
             episode_length += 1
+
         with open(f"results/{run_name}.csv", "a") as f:
             f.write(f"{episode},{episode_length}\n")
+
         if len(buffer) >= config.batch_size:
             for _ in range(config.train_steps):
                 loss = train(
@@ -209,10 +214,11 @@ def main(config: DictConfig):
                 )
             writer.add_scalar("episode_length", episode_length, episode)
             writer.add_scalar("loss", loss, episode)
+
             if (
-                episode % 25 == 0
-                and config.method == "KAN"
-                and episode < int(config.n_episodes * (1 / 2))
+                    episode % 25 == 0
+                    and config.method == "KAN"
+                    and episode < int(config.n_episodes * (1 / 2))
             ):
                 q_network.update_grid_from_samples(buffer.observations[: len(buffer)])
                 target_network.update_grid_from_samples(

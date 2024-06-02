@@ -3,10 +3,10 @@ import numpy as np
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, observation_dim):
+    def __init__(self, capacity:int, observation_dim:int, action_dim:int):
         self.capacity = capacity
         self.observations = torch.zeros(capacity, observation_dim)
-        self.actions = torch.zeros(capacity, 1, dtype=torch.int64)
+        self.actions = torch.zeros(capacity, action_dim, dtype=torch.int64)
         self.next_observations = torch.zeros(capacity, observation_dim)
         self.rewards = torch.zeros(capacity, 1)
         self.terminations = torch.zeros(capacity, 1, dtype=torch.int)
